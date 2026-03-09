@@ -62,15 +62,26 @@ BASE_CAPTION_TEMPLATE = {
 }
 
 
+def resolve_llm_dtype(device):
+    if device.startswith("cuda"):
+        return (
+            torch.bfloat16
+            if torch.cuda.is_bf16_supported(including_emulation=False)
+            else torch.float32
+        )
+    return torch.float32
+
+
 class MingAudio:
     def __init__(self, model_path, device="cuda:0"):
         self.device = device
+        self.llm_dtype = resolve_llm_dtype(device)
         self.model = BailingMMNativeForConditionalGeneration.from_pretrained(
             model_path,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=self.llm_dtype,
             low_cpu_mem_usage=True,
         )
-        self.model = self.model.eval().to(torch.bfloat16).to(self.device)
+        self.model = self.model.eval().to(self.llm_dtype).to(self.device)
 
         if self.model.model_type == 'dense':
             self.tokenizer = AutoTokenizer.from_pretrained(model_path)
@@ -164,7 +175,7 @@ class MingAudio:
         if prompt_wav_path is None:
             prompt_waveform, prompt_text, spk_emb = None, None, None
             if use_zero_spk_emb:
-                spk_emb = [torch.zeros(1, 192, device=self.device, dtype=torch.bfloat16)]
+                spk_emb = [torch.zeros(1, 192, device=self.device, dtype=self.llm_dtype)]
         else:
             paths = prompt_wav_path if isinstance(prompt_wav_path, list) else [prompt_wav_path]
             processed_prompts = [self.preprocess_one_prompt_wav(p, use_spk_emb) for p in paths]

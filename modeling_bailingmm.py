@@ -53,27 +53,14 @@ class BailingMMNativeForConditionalGeneration(PreTrainedModel):
         self.spk_head = nn.Linear(192, self.model.config.hidden_size, bias=True)
         self.post_init()
 
-    # dtype strategy 
-    # 1. BFLOAT16 (A100/H100/L4): Fast path. 8-bit exponent matches FP32;
-    #    ISTFT complex math and ODE solvers are numerically safe here.
-    # 
-    # 2. FLOAT16 (T4/Legacy): 5-bit exponent (max ~65k) is a death trap for 
-    #    audio spectrograms and ODE trajectories. Results in ComplexHalf NaN.
-    #
-    # 3. WHY FULL FP32 ON T4? 
-    #    - Transformers `from_pretrained` overwrites granular `module.float()` 
-    #      calls in-place post-init. 
-    #    - Buffer mismatches (e.g. Hann window) trigger NaNs even if weights 
-    #      are FP32.
-    #    - Memory Trade-off: 0.5B LLM adds ~1GB overhead.
-    #
-    #   generate() detects fp16 and casts the whole model to fp32 once per
-    #   call via self.float(). autocast is skipped on the fp16 path.
-
     @property
     def _infer_dtype(self) -> torch.dtype:
-        """Read actual dtype from LLM backbone params — truth after from_pretrained."""
         return next(self.model.parameters()).dtype
+
+    def _autocast_context(self):
+        enabled = self.device.type == 'cuda' and self._infer_dtype in (torch.float16, torch.bfloat16)
+        dtype = self._infer_dtype if enabled else torch.bfloat16
+        return torch.autocast(device_type=self.device.type, dtype=dtype, enabled=enabled)
 
     def get_rope_index(
         self,
@@ -182,8 +169,10 @@ class BailingMMNativeForConditionalGeneration(PreTrainedModel):
     def prepare_inputs_for_generation(self):
         pass
 
-    def prepare_input_embed(self, prompt, text, spk_emb=None, instruction=None,
-                            prompt_latent=None, prompt_text=None, use_zero_spk_emb=False):
+    def prepare_input_embed(self, prompt, text, spk_emb=None, instruction=None,prompt_latent=None, prompt_text=None, use_zero_spk_emb=False):
+        """
+        Prepares the input embeddings for the model by constructing a complex sequence of text tokens and injecting continuous features like speaker embeddings and audio latents.
+        """
         spk_emb_prompt = []
         if spk_emb is not None:
             for i, se in enumerate(spk_emb):
@@ -268,6 +257,7 @@ class BailingMMNativeForConditionalGeneration(PreTrainedModel):
             audio_token_id = self.tokenizer.convert_tokens_to_ids("<audio>")
             audio_indices = torch.where(input_ids[0] == audio_token_id)[0]
             assert len(audio_indices) > 0
+            # 只考虑batchsize=1
             inputs_embeds[0, audio_indices[0] + 1:audio_indices[0] + 1 + prompt_latent.size(1), :] = prompt_latent[0]
 
         return input_ids, inputs_embeds
@@ -325,13 +315,11 @@ class BailingMMNativeForConditionalGeneration(PreTrainedModel):
             )
             self.rope_deltas = rope_deltas
 
-        # Use actual dtype from params (post from_pretrained)
-        run_dtype = self._infer_dtype
         past_key_values = None
         result = []
 
         for step in tqdm(range(max_decode_steps)):
-            with torch.autocast(device_type='cuda', dtype=run_dtype):
+            with self._autocast_context():
                 outputs = self.model(
                     attention_mask=attention_mask,
                     position_ids=position_ids,
@@ -396,49 +384,49 @@ class BailingMMNativeForConditionalGeneration(PreTrainedModel):
     def generate(self, prompt, text, spk_emb=None, instruction=None,
                  prompt_waveform=None, prompt_text=None, max_decode_steps=200,
                  cfg=2.0, sigma=0.25, temperature=0, use_zero_spk_emb=False):
-
-        # T4 float32 upgrade 
-        # from_pretrained() casts ALL parameters AND buffers (incl. ISTFT
-        # Hann window) in-place after __init__, so any dtype surgery in
-        # __init__ is silently undone. The only reliable fix on float16
-        # hardware is to upcast the entire model to float32 right here,
-        # before any computation. On bfloat16 hardware this branch is
-        # skipped entirely — zero cost, original performance preserved.
         if self._infer_dtype == torch.float16:
-            logger.info("[dtype] T4: upcasting entire model to float32 for this call")
-            self.float()   # casts ALL params + buffers in one shot
+            logger.info("[dtype] T4: upcasting model to float32 for this call")
+            self.float()
 
         stream_state = (None, None, None)
         past_key_values = None
         use_cache = True
         speech = []
+        sampled_tokens_list = []
 
-        for sampled_tokens, last_chunk in self.sample(
-            prompt=prompt, text=text, spk_emb=spk_emb, instruction=instruction,
-            prompt_waveform=prompt_waveform, prompt_text=prompt_text,
-            max_decode_steps=max_decode_steps, cfg=cfg, sigma=sigma,
-            temperature=temperature, use_zero_spk_emb=use_zero_spk_emb,
-        ):
-            speech_tmp, stream_state, past_key_values = self.audio.decode(
-                sampled_tokens,
-                past_key_values=past_key_values,
-                use_cache=use_cache,
-                stream_state=stream_state,
-                last_chunk=last_chunk,
-            )
-            speech.append(speech_tmp)
+        with self._autocast_context():
+            for sampled_tokens, last_chunk in self.sample(
+                    prompt=prompt,
+                    text=text,
+                    spk_emb=spk_emb,
+                    instruction=instruction,
+                    prompt_waveform=prompt_waveform,
+                    prompt_text=prompt_text,
+                    max_decode_steps=max_decode_steps,
+                    cfg=cfg,
+                    sigma=sigma,
+                    temperature=temperature,
+                    use_zero_spk_emb=use_zero_spk_emb
+            ):
+                speech_tmp, stream_state, past_key_values = self.audio.decode(
+                    sampled_tokens, past_key_values=past_key_values, use_cache=use_cache, stream_state=stream_state, last_chunk=last_chunk
+                )
+                speech.append(speech_tmp)
+                # For non-streaming decode
+                # sampled_tokens_list.append(sampled_tokens)
 
         speech = torch.cat(speech, dim=-1)
         return speech.cpu().float()[0]
 
     @torch.inference_mode()
     def generate_text(self, prompt, text, max_decode_steps=200):
-        assert self.model_type == 'dense', "Not supported for MoE model"
-        run_dtype = self._infer_dtype
         sampled_texts_list = []
-        with torch.autocast(device_type='cuda', dtype=run_dtype):
+        with self._autocast_context():
             for sampled_tokens, last_chunk in self.sample_text(
-                prompt=prompt, text=text, max_decode_steps=max_decode_steps,
+                    prompt=prompt,
+                    text=text,
+                    max_decode_steps=max_decode_steps,
             ):
                 sampled_texts_list.append(sampled_tokens)
+
         return "".join(sampled_texts_list)

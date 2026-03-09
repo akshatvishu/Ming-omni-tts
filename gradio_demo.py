@@ -69,7 +69,7 @@ def resolve_llm_dtype(device):
         return (
             torch.bfloat16
             if torch.cuda.is_bf16_supported(including_emulation=False)
-            else torch.float16
+            else torch.float32
         )
     return torch.float32
 
@@ -138,8 +138,7 @@ class MingRuntime:
             low_cpu_mem_usage=True,
         )
         self.model = self.model.eval().to(self.llm_dtype).to(device)
-        # Note: on float16 hardware (T4), model.generate() calls self.float()
-        # at the start of each call to upcast everything to float32.
+        # Non-bf16 CUDA GPUs such as T4 run directly in float32.
 
         if self.model.model_type == "dense":
             self.tokenizer = AutoTokenizer.from_pretrained(local_model_path)
