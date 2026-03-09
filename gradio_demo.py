@@ -74,8 +74,21 @@ def resolve_llm_dtype(device):
     return torch.float32
 
 
-def pick_attention_backend(prefer_flash: bool = True) -> str:
-    if not torch.cuda.is_available():
+def set_attn_backend(config_like, backend: str):
+    if config_like is None:
+        return
+    if isinstance(config_like, dict):
+        config_like["attn_implementation"] = backend
+        config_like["_attn_implementation"] = backend
+        return
+    config_like.attn_implementation = backend
+    config_like._attn_implementation = backend
+
+
+def resolve_qwen_attention_backend(device, prefer_flash: bool = True) -> str:
+    if not device.startswith("cuda"):
+        return "eager"
+    if not torch.cuda.is_bf16_supported(including_emulation=False):
         return "eager"
     if prefer_flash:
         try:
@@ -108,28 +121,19 @@ class MingRuntime:
             local_model_path = model_path
 
         config = BailingMMConfig.from_pretrained(local_model_path)
-        config.attn_implementation = "eager"
-        config._attn_implementation = "eager"
+        set_attn_backend(config, "eager")
 
-        if isinstance(config.llm_config, dict):
-            config.llm_config["attn_implementation"] = "sdpa"
-            config.llm_config["_attn_implementation"] = "sdpa"
-        else:
-            config.llm_config.attn_implementation = "sdpa"
-            config.llm_config._attn_implementation = "sdpa"
-
-        nested_attn_impl = pick_attention_backend(prefer_flash=True)
+        nested_attn_impl = resolve_qwen_attention_backend(device, prefer_flash=True)
         self.nested_attn_impl = nested_attn_impl
+        set_attn_backend(config.llm_config, nested_attn_impl)
 
         if hasattr(config, "audio_tokenizer_config"):
             if hasattr(config.audio_tokenizer_config, "enc_kwargs"):
                 if "backbone" in config.audio_tokenizer_config.enc_kwargs:
-                    config.audio_tokenizer_config.enc_kwargs["backbone"]["attn_implementation"] = nested_attn_impl
-                    config.audio_tokenizer_config.enc_kwargs["backbone"]["_attn_implementation"] = nested_attn_impl
+                    set_attn_backend(config.audio_tokenizer_config.enc_kwargs["backbone"], nested_attn_impl)
             if hasattr(config.audio_tokenizer_config, "dec_kwargs"):
                 if "backbone" in config.audio_tokenizer_config.dec_kwargs:
-                    config.audio_tokenizer_config.dec_kwargs["backbone"]["attn_implementation"] = nested_attn_impl
-                    config.audio_tokenizer_config.dec_kwargs["backbone"]["_attn_implementation"] = nested_attn_impl
+                    set_attn_backend(config.audio_tokenizer_config.dec_kwargs["backbone"], nested_attn_impl)
 
         self.model = BailingMMNativeForConditionalGeneration.from_pretrained(
             local_model_path,
