@@ -97,28 +97,37 @@ def resolve_qwen_attention_backend(device) -> str:
 class MingAudio:
     def __init__(self, model_path, device="cuda:0"):
         self.device = device
-        self.llm_dtype = resolve_llm_dtype(device)
         local_model_path = model_path if os.path.isdir(model_path) else snapshot_download(repo_id=model_path)
         config = BailingMMConfig.from_pretrained(local_model_path)
-        set_attn_backend(config, "eager")
-        qwen_attn_impl = resolve_qwen_attention_backend(device, prefer_flash=True)
-        set_attn_backend(config.llm_config, qwen_attn_impl)
+        if config.model_type == 'dense':
+            self.llm_dtype = resolve_llm_dtype(device)
+            set_attn_backend(config, "eager")
+            qwen_attn_impl = resolve_qwen_attention_backend(device)
+            set_attn_backend(config.llm_config, qwen_attn_impl)
 
-        if hasattr(config, "audio_tokenizer_config"):
-            if hasattr(config.audio_tokenizer_config, "enc_kwargs"):
-                if "backbone" in config.audio_tokenizer_config.enc_kwargs:
-                    set_attn_backend(config.audio_tokenizer_config.enc_kwargs["backbone"], qwen_attn_impl)
-            if hasattr(config.audio_tokenizer_config, "dec_kwargs"):
-                if "backbone" in config.audio_tokenizer_config.dec_kwargs:
-                    set_attn_backend(config.audio_tokenizer_config.dec_kwargs["backbone"], qwen_attn_impl)
+            if hasattr(config, "audio_tokenizer_config"):
+                if hasattr(config.audio_tokenizer_config, "enc_kwargs"):
+                    if "backbone" in config.audio_tokenizer_config.enc_kwargs:
+                        set_attn_backend(config.audio_tokenizer_config.enc_kwargs["backbone"], qwen_attn_impl)
+                if hasattr(config.audio_tokenizer_config, "dec_kwargs"):
+                    if "backbone" in config.audio_tokenizer_config.dec_kwargs:
+                        set_attn_backend(config.audio_tokenizer_config.dec_kwargs["backbone"], qwen_attn_impl)
 
-        self.model = BailingMMNativeForConditionalGeneration.from_pretrained(
-            local_model_path,
-            config=config,
-            torch_dtype=self.llm_dtype,
-            low_cpu_mem_usage=True,
-        )
-        self.model = self.model.eval().to(self.llm_dtype).to(self.device)
+            self.model = BailingMMNativeForConditionalGeneration.from_pretrained(
+                local_model_path,
+                config=config,
+                torch_dtype=self.llm_dtype,
+                low_cpu_mem_usage=True,
+            )
+            self.model = self.model.eval().to(self.llm_dtype).to(self.device)
+        else:
+            self.llm_dtype = torch.bfloat16
+            self.model = BailingMMNativeForConditionalGeneration.from_pretrained(
+                local_model_path,
+                torch_dtype=self.llm_dtype,
+                low_cpu_mem_usage=True,
+            )
+            self.model = self.model.eval().to(self.llm_dtype).to(self.device)
 
         if self.model.model_type == 'dense':
             self.tokenizer = AutoTokenizer.from_pretrained(local_model_path)
@@ -259,6 +268,8 @@ class MingAudio:
 
 
 if __name__ == "__main__":
+    # Dense 0.5B automatically falls back to float32 on non-bf16 CUDA GPUs such as T4.
+    # MoE loading and inference remain unchanged.
     model = MingAudio("inclusionAI/Ming-omni-tts-0.5B")
     # model = MingAudio("inclusionAI/Ming-omni-tta-0.5B")  # Only for TTA task
     # model = MingAudio("inclusionAI/Ming-omni-tts-16.8B-A3B")

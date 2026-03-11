@@ -117,7 +117,7 @@ class MingRuntime:
         config = BailingMMConfig.from_pretrained(local_model_path)
         set_attn_backend(config, "eager")
 
-        nested_attn_impl = resolve_qwen_attention_backend(device, prefer_flash=True)
+        nested_attn_impl = resolve_qwen_attention_backend(device)
         self.nested_attn_impl = nested_attn_impl
         set_attn_backend(config.llm_config, nested_attn_impl)
 
