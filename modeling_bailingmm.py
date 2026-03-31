@@ -3,6 +3,8 @@
 # Copyright (c) Ant Group. All rights reserved.
 import torch
 import torch.nn as nn
+import hashlib
+import os
 from tqdm import tqdm
 from transformers import PreTrainedModel, Qwen2ForCausalLM, Qwen2Config
 from loguru import logger
@@ -452,6 +454,20 @@ class BailingMMNativeForConditionalGeneration(PreTrainedModel):
 
             # Predict the latent for the current timestep using the Flow Matching head, conditioned on the history and other inputs.
             sampled_token_latent, trajectory = self.flowloss.sample(z_diff, latent_history, cfg, self.patch_size, sigma=sigma, temperature=temperature)
+            if os.environ.get("MING_DEBUG_PARITY") == "1" and step == 0:
+                flat_patch = sampled_token_latent.detach().to(dtype=torch.float32).reshape(-1).cpu().contiguous()
+                logger.info(
+                    "MING_UPSTREAM_STAGE0_PARITY {}",
+                    {
+                        "shape": tuple(sampled_token_latent.shape),
+                        "mean": float(flat_patch.mean().item()),
+                        "std": float(flat_patch.std(unbiased=False).item()),
+                        "min": float(flat_patch.min().item()),
+                        "max": float(flat_patch.max().item()),
+                        "first8": flat_patch[:8].tolist(),
+                        "sha256_fp32": hashlib.sha256(flat_patch.numpy().tobytes()).hexdigest(),
+                    },
+                )
             result.append(sampled_token_latent)
 
             # Check if the generation is complete.
